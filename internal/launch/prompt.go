@@ -1,5 +1,7 @@
 package launch
 
+import "github.com/tik-choco/furu/internal/commitcmd"
+
 const basePrompt = `# furu harness
 
 あなたは Orchestrator です。作業は Orchestrator-Workers Pattern で行う。
@@ -18,10 +20,13 @@ const basePrompt = `# furu harness
 - 品質・コスト・効率を最適化する。worker の結果は必ず自分で確認してから統合する。
 `
 
-func orchestratorPrompt(commitCommand string) string {
+func orchestratorPrompt(commit commitcmd.Result) string {
 	git := "# Git\n"
-	if commitCommand != "" {
-		git += "- commit / push は `" + commitCommand + " \"<message>\"` を使う。git commit / git push を直接使わない。\n"
+	if commit.Command != "" {
+		git += "- commit / push は `" + commit.Command + " \"<message>\"` を使う。git commit / git push を直接使わない。\n"
+		if commit.Source == commitcmd.SourceAuto {
+			git += "  commit のみは --no-push、ステージ済みの変更だけなら -s を付ける。\n"
+		}
 	}
 	git += "- commit の author はこの PC の git user のままにする。Co-Authored-By などの Claude の署名行は付けない。\n" +
 		"- commit / push はユーザーに頼まれたときだけ行う。\n"

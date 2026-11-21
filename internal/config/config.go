@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -26,8 +25,8 @@ type Config struct {
 	Orchestrator         Model           `json:"orchestrator"`
 	WorkerTimeoutMinutes int             `json:"worker_timeout_minutes"`
 	Tiers                map[string]Tier `json:"tiers"`
-	// CommitCommand, when set, is the command the orchestrator must use for
-	// commit/push instead of plain git (e.g. a local wrapper script).
+	// CommitCommand selects auto-detection (empty or "auto"), plain "git",
+	// or an explicit commit wrapper.
 	CommitCommand string `json:"commit_command,omitempty"`
 }
 
@@ -127,7 +126,7 @@ func decode(path string, data []byte) (Config, error) {
 		cfg.WorkerTimeoutMinutes = *minutes
 	}
 	cfg.Orchestrator.merge(overrides.Orchestrator)
-	cfg.CommitCommand = strings.TrimSpace(overrides.CommitCommand)
+	cfg.CommitCommand = overrides.CommitCommand
 	for name, override := range overrides.Tiers {
 		tier := cfg.Tiers[name]
 		tier.Codex.merge(override.Codex)

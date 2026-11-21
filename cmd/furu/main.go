@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/tik-choco/furu/internal/commitcmd"
 	"github.com/tik-choco/furu/internal/config"
 	"github.com/tik-choco/furu/internal/launch"
 	"github.com/tik-choco/furu/internal/mcp"
@@ -40,6 +41,11 @@ func run(args []string) (int, error) {
 			return 0, nil
 		case "doctor":
 			preflight.Check(preflight.Options{Versions: true, Login: true}, os.Stdout, os.Stderr)
+			cfg, _, err := config.Load()
+			if err != nil {
+				return 1, err
+			}
+			showCommit(commitcmd.Resolve(cfg.CommitCommand))
 			return 0, nil
 		case "update":
 			preflight.Check(preflight.Options{Versions: true, Update: true}, os.Stdout, os.Stderr)
@@ -61,6 +67,12 @@ func run(args []string) (int, error) {
 			if err := encoder.Encode(cfg); err != nil {
 				return 1, err
 			}
+			commit := commitcmd.Resolve(cfg.CommitCommand)
+			command := commit.Command
+			if command == "" {
+				command = "git"
+			}
+			fmt.Fprintf(os.Stdout, "commit: %s (%s)\n", command, commit.Source)
 			return 0, nil
 		case "mcp":
 			if err := mcp.Serve(os.Stdin, os.Stdout, worker.New(cfg, cachePath)); err != nil {
@@ -82,10 +94,23 @@ func run(args []string) (int, error) {
 		Versions: !noUpdate, Update: !noUpdate, Login: true,
 	}, os.Stdout, os.Stderr)
 	preflight.ShowModels(cfg, cachePath, result.CodexPath, !noUpdate, os.Stdout, os.Stderr)
+	commit := commitcmd.Resolve(cfg.CommitCommand)
+	showCommit(commit)
 	if result.ClaudePath == "" || result.ClaudeAuthFailed {
 		return 1, nil
 	}
-	return launch.Run(result.ClaudePath, cfg, claudeArgs)
+	return launch.Run(result.ClaudePath, cfg, commit, claudeArgs)
+}
+
+func showCommit(commit commitcmd.Result) {
+	switch commit.Source {
+	case commitcmd.SourceAuto:
+		fmt.Fprintf(os.Stderr, "furu: commit: %s (自動検知)\n", commit.Command)
+	case commitcmd.SourceConfig:
+		fmt.Fprintf(os.Stderr, "furu: commit: %s (設定)\n", commit.Command)
+	default:
+		fmt.Fprintln(os.Stderr, "furu: commit: git")
+	}
 }
 
 func launchArgs(args []string) (claudeArgs []string, noUpdate bool) {

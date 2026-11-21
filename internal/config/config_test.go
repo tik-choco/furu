@@ -55,6 +55,23 @@ func TestLoadErrorsIncludePath(t *testing.T) {
 	}
 }
 
+func TestLoadCommitCommand(t *testing.T) {
+	for _, tc := range []struct{ name, input, want string }{
+		{"absent", `{}`, ""},
+		{"empty", `{"commit_command":""}`, ""},
+		{"auto", `{"commit_command":"auto"}`, "auto"},
+		{"git", `{"commit_command":"git"}`, "git"},
+		{"explicit", `{"commit_command":"  my-wrapper -y  "}`, "  my-wrapper -y  "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := loadFile(writeConfig(t, tc.input))
+			if err != nil || got.CommitCommand != tc.want {
+				t.Errorf("loaded commit_command = %q, error = %v, want %q", got.CommitCommand, err, tc.want)
+			}
+		})
+	}
+}
+
 func writeConfig(t *testing.T, input string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.json")

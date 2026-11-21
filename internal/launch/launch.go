@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/tik-choco/furu/internal/cli"
+	"github.com/tik-choco/furu/internal/commitcmd"
 	"github.com/tik-choco/furu/internal/config"
 )
 
@@ -24,6 +25,7 @@ type settings struct {
 	Env         map[string]string `json:"env"`
 	Permissions struct {
 		Allow []string `json:"allow"`
+		Deny  []string `json:"deny,omitempty"`
 	} `json:"permissions"`
 }
 
@@ -33,7 +35,7 @@ type mcpServer struct {
 	Args    []string `json:"args"`
 }
 
-func Args(cfg config.Config, executable string, userArgs []string) []string {
+func Args(cfg config.Config, commit commitcmd.Result, executable string, userArgs []string) []string {
 	var args []string
 	if !hasFlag(userArgs, "--model") {
 		args = append(args, "--model", cfg.Orchestrator.Model)
@@ -47,6 +49,9 @@ func Args(cfg config.Config, executable string, userArgs []string) []string {
 		"MCP_TOOL_TIMEOUT": strconv.FormatInt(cfg.WorkerTimeout().Milliseconds()+time.Minute.Milliseconds(), 10),
 	}
 	s.Permissions.Allow = []string{"mcp__furu__delegate"}
+	if commit.Command != "" {
+		s.Permissions.Deny = []string{"Bash(git commit:*)", "Bash(git push:*)"}
+	}
 	settingsJSON, _ := json.Marshal(s)
 	mcpJSON, _ := json.Marshal(struct {
 		MCPServers map[string]mcpServer `json:"mcpServers"`
@@ -55,7 +60,7 @@ func Args(cfg config.Config, executable string, userArgs []string) []string {
 			"furu": {Type: "stdio", Command: executable, Args: []string{"mcp"}},
 		},
 	})
-	args = append(args, "--append-system-prompt", orchestratorPrompt(cfg.CommitCommand),
+	args = append(args, "--append-system-prompt", orchestratorPrompt(commit),
 		"--settings", string(settingsJSON), "--mcp-config", string(mcpJSON))
 	return append(args, userArgs...)
 }
@@ -72,7 +77,7 @@ func hasFlag(args []string, flag string) bool {
 	return false
 }
 
-func Run(claudePath string, cfg config.Config, userArgs []string) (int, error) {
+func Run(claudePath string, cfg config.Config, commit commitcmd.Result, userArgs []string) (int, error) {
 	if cli.IsShim(claudePath) {
 		return 1, fmt.Errorf("interactive Claude requires claude.exe on PATH (found %s)", claudePath)
 	}
@@ -84,7 +89,7 @@ func Run(claudePath string, cfg config.Config, userArgs []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	cmd := exec.CommandContext(context.Background(), claudePath, Args(cfg, executable, userArgs)...)
+	cmd := exec.CommandContext(context.Background(), claudePath, Args(cfg, commit, executable, userArgs)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 
 	// The child receives terminal interrupts independently.

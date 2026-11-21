@@ -18,9 +18,9 @@ go build -o bin/furu.exe ./cmd/furu
 | --- | --- |
 | `furu [Claude の引数 ...]` | バージョンとログイン状態を確認し、Claude を起動します。 |
 | `furu --no-update [Claude の引数 ...]` | ログイン状態を確認し、キャッシュ済みのモデル情報を表示して Claude を起動します。 |
-| `furu doctor` | インストール済みのバージョン、npm の最新版、ログイン状態を表示します。 |
+| `furu doctor` | インストール済みのバージョン、npm の最新版、ログイン状態、使う commit コマンドを表示します。 |
 | `furu update` | 古い Claude Code と Codex を更新します。 |
-| `furu config` | 設定ファイルのパスと有効な設定を JSON で表示します。 |
+| `furu config` | 設定ファイルのパスと有効な設定を表示し、設定の JSON に続けて使う commit コマンドと選択元を表示します。 |
 | `furu model` | モデル設定を表示し、端末からは対話形式で変更できます。 |
 | `furu help` | ヘルプを表示します。 |
 | `furu mcp` | Claude が起動する stdio MCP サーバーです。 |
@@ -45,7 +45,11 @@ Windows では `%AppData%\furu\config.json` に設定を置けます。実際の
 
 ### commit コマンド
 
-`commit_command` を設定すると、Orchestrator は commit / push にそのコマンドを使い、`git commit` / `git push` を直接使わなくなります（例: 社内・個人のラッパースクリプト）。未設定なら通常の git を使います。どちらの場合も、author はその PC の git user のままにし、Claude の署名行（Co-Authored-By）は付けません。
+`commit_command` の既定は自動検知です。未設定、`""`、または `"auto"` のときは PATH 上の `guru` を探します。`guru save --help` の出力に `--no-push` と `--yes` の両方があれば `guru s -y` を使い、それ以外は通常の git を使います。
+
+`"git"` を指定すると自動検知を無効にして通常の git を使います。それ以外のコマンドを明示すると、そのコマンドが自動検知より優先されます。
+
+ラッパーを使う場合、Orchestrator は `<コマンド> "<メッセージ>"` で commit / push を実行します。Claude Code の `permissions.deny` に `Bash(git commit:*)` と `Bash(git push:*)` を追加し、直接実行を禁止します。自動検知した `guru` では、commit のみなら `--no-push`、ステージ済みの変更だけなら `-s` を付けます。commit の author はその PC の git user のままにし、Claude の署名行（Co-Authored-By）は付けません。
 
 ```json
 {
