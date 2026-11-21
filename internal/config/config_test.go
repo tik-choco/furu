@@ -72,6 +72,49 @@ func TestLoadCommitCommand(t *testing.T) {
 	}
 }
 
+func TestGitSyncEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name, input string
+		enabled     bool
+	}{
+		{"omitted", `{}`, true},
+		{"enabled", `{"git_sync":true}`, true},
+		{"disabled", `{"git_sync":false}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := loadFile(writeConfig(t, tc.input))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.GitSyncEnabled() != tc.enabled {
+				t.Errorf("GitSyncEnabled() = %v, want %v", cfg.GitSyncEnabled(), tc.enabled)
+			}
+		})
+	}
+}
+
+func TestModelEditsPreserveGitSync(t *testing.T) {
+	path := writeConfig(t, `{"git_sync":false}`)
+	if _, err := SetModel(path, "orchestrator", "claude", Model{Effort: "max"}); err != nil {
+		t.Fatal(err)
+	}
+	assertDisabled := func() {
+		t.Helper()
+		cfg, err := loadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.GitSyncEnabled() {
+			t.Fatal("model edit removed git_sync: false")
+		}
+	}
+	assertDisabled()
+	if _, err := ResetModels(path, ""); err != nil {
+		t.Fatal(err)
+	}
+	assertDisabled()
+}
+
 func writeConfig(t *testing.T, input string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.json")

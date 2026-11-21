@@ -7,6 +7,7 @@ import (
 
 	"github.com/tik-choco/furu/internal/commitcmd"
 	"github.com/tik-choco/furu/internal/config"
+	"github.com/tik-choco/furu/internal/gitsync"
 	"github.com/tik-choco/furu/internal/launch"
 	"github.com/tik-choco/furu/internal/mcp"
 	"github.com/tik-choco/furu/internal/modelcmd"
@@ -16,13 +17,13 @@ import (
 )
 
 const usage = `使い方
-  furu [--no-update] [Claude の引数 ...]  確認後、Claude を起動
-  furu doctor                           バージョンとログイン状態を表示
-  furu update                           古い CLI を更新
-  furu config                           設定ファイルのパスと有効な設定を表示
-  furu model [list | set | reset]        モデル設定を表示・変更
-  furu mcp                              Claude が起動する stdio MCP サーバー
-  furu help | -h | --help               ヘルプを表示
+  furu [--no-update] [--no-pull] [Claude の引数 ...]  確認後、Claude を起動
+  furu doctor                                       バージョンとログイン状態を表示
+  furu update                                       古い CLI を更新
+  furu config                                       設定ファイルのパスと有効な設定を表示
+  furu model [list | set | reset]                    モデル設定を表示・変更
+  furu mcp                                          Claude が起動する stdio MCP サーバー
+  furu help | -h | --help                           ヘルプを表示
 `
 
 func main() {
@@ -80,16 +81,14 @@ func run(args []string) (int, error) {
 			}
 			return 0, nil
 		case "model":
-			stat, err := os.Stdin.Stat()
-			interactive := err == nil && stat.Mode()&os.ModeCharDevice != 0
-			if err := modelcmd.Run(args[1:], cfg, path, interactive, os.Stdin, os.Stdout, os.Stderr); err != nil {
+			if err := modelcmd.Run(args[1:], cfg, path, stdinIsTerminal(), os.Stdin, os.Stdout, os.Stderr); err != nil {
 				return 1, err
 			}
 			return 0, nil
 		}
 	}
 
-	claudeArgs, noUpdate := launchArgs(args)
+	claudeArgs, noUpdate, noPull := launchArgs(args)
 	result := preflight.Check(preflight.Options{
 		Versions: !noUpdate, Update: !noUpdate, Login: true,
 	}, os.Stdout, os.Stderr)
@@ -99,7 +98,15 @@ func run(args []string) (int, error) {
 	if result.ClaudePath == "" || result.ClaudeAuthFailed {
 		return 1, nil
 	}
+	if !noPull && cfg.GitSyncEnabled() {
+		gitsync.Run(os.Stdin, os.Stderr, stdinIsTerminal())
+	}
 	return launch.Run(result.ClaudePath, cfg, commit, claudeArgs)
+}
+
+func stdinIsTerminal() bool {
+	stat, err := os.Stdin.Stat()
+	return err == nil && stat.Mode()&os.ModeCharDevice != 0
 }
 
 func showCommit(commit commitcmd.Result) {
@@ -113,16 +120,18 @@ func showCommit(commit commitcmd.Result) {
 	}
 }
 
-func launchArgs(args []string) (claudeArgs []string, noUpdate bool) {
+func launchArgs(args []string) (claudeArgs []string, noUpdate, noPull bool) {
 	for i, arg := range args {
 		switch arg {
 		case "--":
-			return append(claudeArgs, args[i:]...), noUpdate
+			return append(claudeArgs, args[i:]...), noUpdate, noPull
 		case "--no-update":
 			noUpdate = true
+		case "--no-pull":
+			noPull = true
 		default:
 			claudeArgs = append(claudeArgs, arg)
 		}
 	}
-	return claudeArgs, noUpdate
+	return claudeArgs, noUpdate, noPull
 }

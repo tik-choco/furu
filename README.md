@@ -16,8 +16,9 @@ go build -o bin/furu.exe ./cmd/furu
 
 | コマンド | 動作 |
 | --- | --- |
-| `furu [Claude の引数 ...]` | バージョンとログイン状態を確認し、Claude を起動します。 |
-| `furu --no-update [Claude の引数 ...]` | ログイン状態を確認し、キャッシュ済みのモデル情報を表示して Claude を起動します。 |
+| `furu [Claude の引数 ...]` | バージョンとログイン状態を確認し、Git を同期してから Claude を起動します。 |
+| `furu --no-update [Claude の引数 ...]` | ログイン状態を確認し、キャッシュ済みのモデル情報を表示し、Git を同期してから Claude を起動します。 |
+| `furu --no-pull [Claude の引数 ...]` | Git の fetch、ブランチ切替の確認、fast-forward 更新を省略して Claude を起動します。 |
 | `furu doctor` | インストール済みのバージョン、npm の最新版、ログイン状態、使う commit コマンドを表示します。 |
 | `furu update` | 古い Claude Code と Codex を更新します。 |
 | `furu config` | 設定ファイルのパスと有効な設定を表示し、設定の JSON に続けて使う commit コマンドと選択元を表示します。 |
@@ -42,6 +43,8 @@ Windows では `%AppData%\furu\config.json` に設定を置けます。実際の
   }
 }
 ```
+
+`git_sync` は既定で `true` です。起動時に Git の作業ツリーで fetch し、`main` / `master` で `develop` があれば端末で切り替えを確認します。現在のブランチは upstream から fast-forward で更新します。`"git_sync": false` で無効にできます。
 
 ### commit コマンド
 

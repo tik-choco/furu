@@ -28,6 +28,7 @@ type Config struct {
 	// CommitCommand selects auto-detection (empty or "auto"), plain "git",
 	// or an explicit commit wrapper.
 	CommitCommand string `json:"commit_command,omitempty"`
+	GitSync       *bool  `json:"git_sync,omitempty"`
 }
 
 func TierNames() []string {
@@ -61,6 +62,11 @@ func Defaults() Config {
 
 func (c Config) WorkerTimeout() time.Duration {
 	return time.Duration(c.WorkerTimeoutMinutes) * time.Minute
+}
+
+// GitSyncEnabled reports whether launch should sync the current work tree.
+func (c Config) GitSyncEnabled() bool {
+	return c.GitSync == nil || *c.GitSync
 }
 
 func Load() (Config, string, error) {
@@ -102,6 +108,7 @@ func decode(path string, data []byte) (Config, error) {
 		WorkerTimeoutMinutes *int            `json:"worker_timeout_minutes"`
 		Tiers                map[string]Tier `json:"tiers"`
 		CommitCommand        string          `json:"commit_command"`
+		GitSync              *bool           `json:"git_sync"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -127,6 +134,7 @@ func decode(path string, data []byte) (Config, error) {
 	}
 	cfg.Orchestrator.merge(overrides.Orchestrator)
 	cfg.CommitCommand = overrides.CommitCommand
+	cfg.GitSync = overrides.GitSync
 	for name, override := range overrides.Tiers {
 		tier := cfg.Tiers[name]
 		tier.Codex.merge(override.Codex)
