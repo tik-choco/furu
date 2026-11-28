@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -20,13 +21,22 @@ import (
 
 func TestCodexArgs(t *testing.T) {
 	model := config.Model{Model: "gpt-6.2-sol", Effort: "high"}
+	const cwd, output = `C:\some project`, `C:\temp dir\output.txt`
+	images := []string{`C:\some project\local.png`, `C:\other dir\shared.png`}
+	extraDirs := []string{`C:\other dir`}
 	for _, tc := range []struct {
-		write   bool
-		sandbox string
-	}{{false, "read-only"}, {true, "workspace-write"}} {
-		want := []string{"exec", "-m", "gpt-6.2-sol", "-c", `model_reasoning_effort="high"`,
-			"-s", tc.sandbox, "--skip-git-repo-check", "-C", `C:\some project`, "-o", `C:\temp dir\output.txt`, "-"}
-		if got := codexArgs(model, tc.write, `C:\some project`, `C:\temp dir\output.txt`); !slices.Equal(got, want) {
+		write                bool
+		sandbox              string
+		images, dirs, prefix []string
+	}{
+		{false, "read-only", nil, nil, []string{"exec"}},
+		{true, "workspace-write", nil, nil, []string{"exec"}},
+		{false, "read-only", images, extraDirs, []string{"exec", "-i", images[0], "-i", images[1]}},
+		{true, "workspace-write", images, extraDirs, []string{"exec", "-i", images[0], "-i", images[1], "--add-dir", extraDirs[0]}},
+	} {
+		want := append(tc.prefix, "-m", "gpt-6.2-sol", "-c", `model_reasoning_effort="high"`,
+			"-s", tc.sandbox, "--skip-git-repo-check", "-C", cwd, "-o", output, "-")
+		if got := codexArgs(model, tc.write, cwd, output, tc.images, tc.dirs); !slices.Equal(got, want) {
 			t.Errorf("codex args = %q, want %q", got, want)
 		}
 	}
@@ -34,17 +44,110 @@ func TestCodexArgs(t *testing.T) {
 
 func TestClaudeArgs(t *testing.T) {
 	model := config.Model{Model: "claude-opus-5-5", Effort: "medium"}
+	extraDirs := []string{`C:\other dir`, `D:\more images`}
+	read := []string{"--disallowedTools", "Edit,Write,NotebookEdit"}
+	write := []string{"--permission-mode", "acceptEdits"}
 	for _, tc := range []struct {
-		write bool
-		flags []string
+		write               bool
+		dirs, prefix, flags []string
 	}{
-		{false, []string{"--disallowedTools", "Edit,Write,NotebookEdit"}},
-		{true, []string{"--permission-mode", "acceptEdits"}},
+		{false, nil, []string{"-p"}, read},
+		{true, nil, []string{"-p"}, write},
+		{false, extraDirs, []string{"-p", "--add-dir", extraDirs[0], "--add-dir", extraDirs[1]}, read},
+		{true, extraDirs, []string{"-p", "--add-dir", extraDirs[0], "--add-dir", extraDirs[1]}, write},
 	} {
-		want := append([]string{"-p", "--model", "claude-opus-5-5", "--effort", "medium", "--output-format", "text"}, tc.flags...)
-		if got := claudeArgs(model, tc.write); !slices.Equal(got, want) {
+		want := append(tc.prefix, "--model", "claude-opus-5-5", "--effort", "medium", "--output-format", "text")
+		want = append(want, tc.flags...)
+		if got := claudeArgs(model, tc.write, tc.dirs); !slices.Equal(got, want) {
 			t.Errorf("claude args = %q, want %q", got, want)
 		}
+	}
+}
+
+func TestRunWithImages(t *testing.T) {
+	root := t.TempDir()
+	cwd := filepath.Join(root, "project")
+	shared := filepath.Join(root, "project images")
+	other := filepath.Join(root, "other images")
+	nested, duplicate := filepath.Join(cwd, "nested"), shared
+	if runtime.GOOS == "windows" {
+		nested = filepath.Join(root, "PROJECT", "nested")
+		duplicate = filepath.Join(root, "PROJECT IMAGES")
+	}
+	images := []string{
+		filepath.Join(cwd, "local.png"),
+		filepath.Join(nested, "nested.png"),
+		filepath.Join(shared, "shared.png"),
+		filepath.Join(other, "other.png"),
+		filepath.Join(duplicate, "another.png"),
+	}
+	for _, path := range images {
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	paths := slices.Clone(images)
+	paths[0] = "local.png"
+	paths[2] = filepath.Join("..", "project images", "shared.png")
+	const task = "画像を確認する"
+	wantTask := task + "\n\n## 添付画像\n- " + strings.Join(images, "\n- ")
+	codexPrefix := []string{"exec"}
+	for _, image := range images {
+		codexPrefix = append(codexPrefix, "-i", image)
+	}
+	for _, tc := range []struct {
+		backend, modelFlag, report string
+		prefix                     []string
+	}{
+		{"codex", "-m", "\n" + cwd + "\n" + wantTask, append(codexPrefix, "--add-dir", shared, "--add-dir", other)},
+		{"claude", "--model", "\n" + wantTask + "\n各画像は Read ツールで開いて内容を確認すること。",
+			[]string{"-p", "--add-dir", shared, "--add-dir", other}},
+	} {
+		t.Run(tc.backend, func(t *testing.T) {
+			r := testRunner(t, "success")
+			command := r.command
+			r.command = func(ctx context.Context, path string, args ...string) (*exec.Cmd, error) {
+				if args[0] == tc.prefix[0] {
+					end := slices.Index(args, tc.modelFlag)
+					if end < 0 || !slices.Equal(args[:end], tc.prefix) {
+						t.Errorf("worker argv = %q, want prefix %q before %s", args, tc.prefix, tc.modelFlag)
+					}
+				}
+				return command(ctx, path, args...)
+			}
+			result := r.Run(context.Background(), Request{
+				Task: task, Tier: "normal", Backend: tc.backend, CWD: cwd, Images: paths, Write: true,
+			})
+			if result.IsError || !strings.HasSuffix(result.Text, tc.report) {
+				t.Fatalf("result = %+v, want report ending in %q", result, tc.report)
+			}
+		})
+	}
+}
+
+func TestInvalidImageDoesNotStartWorker(t *testing.T) {
+	cwd := t.TempDir()
+	for _, tc := range []struct{ backend, path string }{
+		{"codex", "missing.png"},
+		{"claude", "."},
+	} {
+		t.Run(tc.backend, func(t *testing.T) {
+			r := testRunner(t, "success")
+			r.command = func(context.Context, string, ...string) (*exec.Cmd, error) {
+				t.Error("started a command with an invalid image")
+				return nil, fmt.Errorf("unexpected command")
+			}
+			result := r.Run(context.Background(), Request{
+				Task: "test", Tier: "normal", Backend: tc.backend, CWD: cwd, Images: []string{tc.path},
+			})
+			if !result.IsError || !strings.HasPrefix(result.Text, "[furu] backend="+tc.backend+" ") ||
+				!strings.HasSuffix(result.Text, "\nimage not found: "+filepath.Join(cwd, tc.path)) {
+				t.Fatalf("result = %+v", result)
+			}
+		})
 	}
 }
 

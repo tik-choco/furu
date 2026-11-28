@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"reflect"
 	"slices"
@@ -66,6 +67,8 @@ func TestInitializeAndList(t *testing.T) {
 			InputSchema struct {
 				Required   []string `json:"required"`
 				Properties map[string]struct {
+					Type    string          `json:"type"`
+					Items   json.RawMessage `json:"items"`
 					Enum    []string        `json:"enum"`
 					Default json.RawMessage `json:"default"`
 				} `json:"properties"`
@@ -79,10 +82,12 @@ func TestInitializeAndList(t *testing.T) {
 		t.Fatalf("tool list = %s", reply.Result)
 	}
 	schema := list.Tools[0].InputSchema
+	images := schema.Properties["images"]
 	if !slices.Equal(schema.Required, []string{"task", "tier"}) ||
 		!slices.Equal(schema.Properties["tier"].Enum, []string{"simple", "normal", "hard", "very_hard"}) ||
 		string(schema.Properties["backend"].Default) != `"auto"` ||
-		string(schema.Properties["write"].Default) != "false" {
+		string(schema.Properties["write"].Default) != "false" ||
+		images.Type != "array" || string(images.Items) != `{"type":"string"}` {
 		t.Errorf("delegate schema = %s", reply.Result)
 	}
 	if err := decoder.Decode(new(any)); err != io.EOF {
@@ -112,7 +117,10 @@ func TestJSONRPCErrors(t *testing.T) {
 }
 
 func TestToolsCall(t *testing.T) {
-	want := worker.Request{Task: "調査\n追加の指示", Tier: "hard", Write: true, CWD: "/project", Backend: "claude"}
+	want := worker.Request{
+		Task: "調査\n追加の指示", Tier: "hard", Write: true, CWD: "/project", Backend: "claude",
+		Images: []string{"assets/local.png", "/shared/画像.png"},
+	}
 	runner := fakeWorker(func(_ context.Context, args worker.Request) worker.Result {
 		if !reflect.DeepEqual(args, want) {
 			t.Errorf("worker request = %+v, want %+v", args, want)
@@ -120,7 +128,7 @@ func TestToolsCall(t *testing.T) {
 		return worker.Result{Text: "worker report"}
 	})
 	session := startSession(t, runner)
-	session.send(t, `{"jsonrpc":"2.0","id":"call","method":"tools/call","params":{"name":"delegate","arguments":{"task":"調査\n追加の指示","tier":"hard","write":true,"cwd":"/project","backend":"claude"}}}`)
+	session.send(t, `{"jsonrpc":"2.0","id":"call","method":"tools/call","params":{"name":"delegate","arguments":{"task":"調査\n追加の指示","tier":"hard","write":true,"cwd":"/project","backend":"claude","images":["assets/local.png","/shared/画像.png"]}}}`)
 	reply := session.receive(t)
 	if string(reply.ID) != `"call"` ||
 		string(reply.Result) != `{"content":[{"text":"worker report","type":"text"}],"isError":false}` {
@@ -128,11 +136,31 @@ func TestToolsCall(t *testing.T) {
 	}
 }
 
+func TestToolsCallInvalidImages(t *testing.T) {
+	for _, value := range []string{`null`, `"image.png"`, `{}`, `["image.png",""]`, `[null]`, `[1]`} {
+		t.Run(value, func(t *testing.T) {
+			input := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delegate","arguments":{"task":"t","tier":"normal","images":%s}}}`, value)
+			runner := fakeWorker(func(context.Context, worker.Request) worker.Result {
+				t.Error("invalid images reached the worker")
+				return worker.Result{}
+			})
+			var output bytes.Buffer
+			if err := Serve(strings.NewReader(input), &output, runner); err != nil {
+				t.Fatal(err)
+			}
+			reply := decodeReply(t, json.NewDecoder(&output))
+			if reply.Error == nil || reply.Error.Code != -32602 || reply.Error.Message != `invalid delegate argument "images"` {
+				t.Fatalf("unexpected error: %+v", reply.Error)
+			}
+		})
+	}
+}
+
 func TestParallelCallsAndCancellation(t *testing.T) {
 	started := make(chan string, 2)
 	release := make(chan struct{})
 	runner := fakeWorker(func(ctx context.Context, args worker.Request) worker.Result {
-		if args.Write || args.CWD != "" || args.Backend != "auto" {
+		if args.Write || args.CWD != "" || args.Backend != "auto" || args.Images != nil {
 			t.Errorf("unexpected defaults: %+v", args)
 		}
 		started <- args.Task

@@ -24,6 +24,8 @@ func TestArgs(t *testing.T) {
 		t.Errorf("orchestrator defaults: %v", args[:4])
 	}
 	if args[4] != "--append-system-prompt" || !strings.Contains(args[5], "mcp__furu__delegate") ||
+		!strings.Contains(args[5], "画像ファイルのパスを images に渡す") ||
+		!strings.Contains(args[5], "パスなしで会話に貼られた画像はファイルとして存在せず") ||
 		!strings.Contains(args[5], "`wrap commit \"<message>\"`") ||
 		!strings.Contains(args[5], "git commit / git push を直接使わない。") || strings.Contains(args[5], guruPromptHint) {
 		t.Errorf("missing orchestrator prompt: %v", args[4:6])

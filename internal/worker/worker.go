@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +27,7 @@ type Request struct {
 	Write   bool
 	CWD     string
 	Backend string
+	Images  []string
 }
 
 type Result struct {
@@ -63,9 +66,21 @@ func (r *Runner) Run(ctx context.Context, request Request) Result {
 
 	tier := r.cfg.Tiers[request.Tier]
 	backend, model := "codex", tier.Codex
+	if request.Backend == "claude" {
+		backend, model = "claude", tier.Claude
+	}
+	cwd := request.CWD
+	if cwd == "" {
+		cwd = "."
+	}
+	cwd, err := filepath.Abs(cwd)
+	var extraDirs []string
+	if err == nil {
+		request.Images, extraDirs, err = resolveImages(cwd, request.Images)
+	}
+
 	var path, fallback, family string
-	var err error
-	if request.Backend != "claude" {
+	if err == nil && backend == "codex" {
 		var reason string
 		path, reason, err = r.codex(ctx)
 		if err == nil && reason == "" && models.IsFamily(model.Model) {
@@ -83,7 +98,7 @@ func (r *Runner) Run(ctx context.Context, request Request) Result {
 			}
 		}
 	}
-	if request.Backend == "claude" || fallback != "" {
+	if err == nil && (backend == "claude" || fallback != "") {
 		backend, model = "claude", tier.Claude
 		path, err = r.lookPath("claude")
 		if err != nil {
@@ -94,14 +109,7 @@ func (r *Runner) Run(ctx context.Context, request Request) Result {
 	var report string
 	var stderr tailBuffer
 	if err == nil {
-		cwd := request.CWD
-		if cwd == "" {
-			cwd = "."
-		}
-		cwd, err = filepath.Abs(cwd)
-		if err == nil {
-			report, err = r.run(ctx, backend, path, model, cwd, request, &stderr)
-		}
+		report, err = r.run(ctx, backend, path, model, cwd, request, extraDirs, &stderr)
 	}
 	contextErr := ctx.Err()
 	failed := err != nil || contextErr != nil
@@ -118,6 +126,34 @@ func (r *Runner) Run(ctx context.Context, request Request) Result {
 		header += "fallback: " + fallback + "\n"
 	}
 	return Result{Text: header + report, IsError: failed}
+}
+
+func resolveImages(cwd string, paths []string) (images, extraDirs []string, err error) {
+	for _, path := range paths {
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(cwd, path)
+		}
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			return nil, nil, fmt.Errorf("image not found: %s", path)
+		}
+		images = append(images, path)
+
+		dir := filepath.Dir(path)
+		rel, err := filepath.Rel(cwd, dir)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		if !slices.ContainsFunc(extraDirs, func(existing string) bool {
+			if runtime.GOOS == "windows" {
+				return strings.EqualFold(existing, dir)
+			}
+			return existing == dir
+		}) {
+			extraDirs = append(extraDirs, dir)
+		}
+	}
+	return images, extraDirs, nil
 }
 
 func (r *Runner) resolveCodex(ctx context.Context, codexPath, family string) (slug, reason string, err error) {
@@ -186,7 +222,7 @@ func (r *Runner) probeCodex() (path, reason string) {
 	return path, ""
 }
 
-func (r *Runner) run(ctx context.Context, backend, path string, model config.Model, cwd string, request Request, stderr *tailBuffer) (string, error) {
+func (r *Runner) run(ctx context.Context, backend, path string, model config.Model, cwd string, request Request, extraDirs []string, stderr *tailBuffer) (string, error) {
 	var args []string
 	var stdout bytes.Buffer
 	var outputPath string
@@ -200,16 +236,23 @@ func (r *Runner) run(ctx context.Context, backend, path string, model config.Mod
 		if err := file.Close(); err != nil {
 			return "", err
 		}
-		args = codexArgs(model, request.Write, cwd, outputPath)
+		args = codexArgs(model, request.Write, cwd, outputPath, request.Images, extraDirs)
 	} else {
-		args = claudeArgs(model, request.Write)
+		args = claudeArgs(model, request.Write, extraDirs)
+	}
+	task := request.Task
+	if len(request.Images) > 0 {
+		task += "\n\n## 添付画像\n- " + strings.Join(request.Images, "\n- ")
+		if backend == "claude" {
+			task += "\n各画像は Read ツールで開いて内容を確認すること。"
+		}
 	}
 	cmd, err := r.command(ctx, path, args...)
 	if err != nil {
 		return "", err
 	}
 	cmd.Dir = cwd
-	cmd.Stdin = strings.NewReader(request.Task)
+	cmd.Stdin = strings.NewReader(task)
 	cmd.Stderr = stderr
 	if backend == "claude" {
 		cmd.Stdout = &stdout
@@ -227,18 +270,29 @@ func (r *Runner) run(ctx context.Context, backend, path string, model config.Mod
 	return string(report), nil
 }
 
-func codexArgs(model config.Model, write bool, cwd, output string) []string {
+func codexArgs(model config.Model, write bool, cwd, output string, images, extraDirs []string) []string {
+	args := []string{"exec"}
+	for _, image := range images {
+		args = append(args, "-i", image)
+	}
 	sandbox := "read-only"
 	if write {
 		sandbox = "workspace-write"
+		for _, dir := range extraDirs {
+			args = append(args, "--add-dir", dir)
+		}
 	}
 	effort, _ := json.Marshal(model.Effort)
-	return []string{"exec", "-m", model.Model, "-c", "model_reasoning_effort=" + string(effort),
-		"-s", sandbox, "--skip-git-repo-check", "-C", cwd, "-o", output, "-"}
+	return append(args, "-m", model.Model, "-c", "model_reasoning_effort="+string(effort),
+		"-s", sandbox, "--skip-git-repo-check", "-C", cwd, "-o", output, "-")
 }
 
-func claudeArgs(model config.Model, write bool) []string {
-	args := []string{"-p", "--model", model.Model, "--effort", model.Effort, "--output-format", "text"}
+func claudeArgs(model config.Model, write bool, extraDirs []string) []string {
+	args := []string{"-p"}
+	for _, dir := range extraDirs {
+		args = append(args, "--add-dir", dir)
+	}
+	args = append(args, "--model", model.Model, "--effort", model.Effort, "--output-format", "text")
 	if write {
 		return append(args, "--permission-mode", "acceptEdits")
 	}

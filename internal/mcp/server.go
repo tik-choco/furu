@@ -242,12 +242,17 @@ func parseCall(raw json.RawMessage) (worker.Request, error) {
 			target = &args.CWD
 		case "backend":
 			target = &args.Backend
+		case "images":
+			target = &args.Images
 		default:
 			continue
 		}
 		if bytes.Equal(value, []byte("null")) || json.Unmarshal(value, target) != nil {
 			return worker.Request{}, fmt.Errorf("invalid delegate argument %q", name)
 		}
+	}
+	if slices.Contains(args.Images, "") {
+		return worker.Request{}, fmt.Errorf("invalid delegate argument %q", "images")
 	}
 	if args.Task == "" {
 		return worker.Request{}, fmt.Errorf("task is required")
@@ -285,6 +290,10 @@ func delegateTool() map[string]any {
 				},
 				"backend": map[string]any{
 					"type": "string", "enum": []string{"auto", "codex", "claude"}, "default": "auto",
+				},
+				"images": map[string]any{
+					"type": "array", "items": map[string]any{"type": "string"},
+					"description": "Image file paths to attach (absolute, or relative to cwd). The worker can view them and may write next to them when write=true.",
 				},
 			},
 		},

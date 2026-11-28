@@ -30,6 +30,14 @@ go build -o bin/furu.exe ./cmd/furu
 
 `--resume` や `-c` などの引数は Claude に渡ります。`--model` と `--effort` を指定すると、Orchestrator の既定値を上書きできます。
 
+## 画像の受け渡し
+
+`delegate` の `images` に画像ファイルのパス（絶対パス、または `cwd` からの相対パス）を渡すと、Codex には `-i` で画像を添付します。Claude には `task` にパスを追記し、Read ツールで開くよう指示します。
+
+`write=true` で `cwd` の外にある画像を渡すと、Codex と Claude のどちらも `--add-dir` で画像の親ディレクトリを書き込み可能にします。
+
+Claude Code にパスなしで貼り付けた画像はファイルとして残らないため、worker に渡せません。画像をファイルとして保存してパスを伝えるか、ファイルをドラッグ＆ドロップしてパスを渡してください。
+
 ## 設定
 
 Windows では `%AppData%\furu\config.json` に設定を置けます。実際のパスは `furu config` で確認できます。ファイルがなければ組み込みの既定値を使い、指定した項目だけを上書きします。worker の既定タイムアウトは 30 分です。
