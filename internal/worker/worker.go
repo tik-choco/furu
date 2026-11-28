@@ -19,6 +19,7 @@ import (
 	"github.com/tik-choco/furu/internal/config"
 	"github.com/tik-choco/furu/internal/models"
 	"github.com/tik-choco/furu/internal/preflight"
+	"github.com/tik-choco/furu/internal/usage"
 )
 
 type Request struct {
@@ -39,24 +40,71 @@ type Runner struct {
 	cfg      config.Config
 	lookPath func(string) (string, error)
 	command  func(context.Context, string, ...string) (*exec.Cmd, error)
+	usage    *usage.Store
 
-	codexOnce   sync.Once
-	codexReady  chan struct{}
-	codexPath   string
-	codexReason string
-
+	codexCache   probeCache[loginProbe]
 	cachePath    string
-	catalogOnce  sync.Once
-	catalogReady chan struct{}
-	catalog      models.Catalog
-	catalogErr   error
+	catalogCache probeCache[catalogProbe]
 }
 
-func New(cfg config.Config, cachePath string) *Runner {
-	return &Runner{
-		cfg: cfg, lookPath: exec.LookPath, command: cli.Command,
-		codexReady: make(chan struct{}), cachePath: cachePath, catalogReady: make(chan struct{}),
+type loginProbe struct{ path, reason string }
+type catalogProbe struct {
+	catalog models.Catalog
+	err     error
+}
+type probeEntry[T any] struct {
+	ready   chan struct{}
+	value   T
+	expires time.Time
+}
+type probeCache[T any] struct {
+	mu      sync.Mutex
+	current *probeEntry[T]
+}
+
+// Share an in-flight probe without letting a cancelled delegate poison it.
+// Expired successes and failures are rechecked instead of cached forever.
+func (c *probeCache[T]) get(ctx context.Context, load func() (T, time.Duration)) (T, error) {
+	c.mu.Lock()
+	e := c.current
+	if e != nil {
+		select {
+		case <-e.ready:
+			if !time.Now().Before(e.expires) {
+				e = nil
+			}
+		default:
+		}
 	}
+	if e == nil {
+		e = &probeEntry[T]{ready: make(chan struct{})}
+		c.current = e
+		go func(entry *probeEntry[T]) {
+			value, ttl := load()
+			entry.value = value
+			entry.expires = time.Now().Add(ttl)
+			close(entry.ready)
+		}(e)
+	}
+	c.mu.Unlock()
+	select {
+	case <-e.ready:
+		return e.value, ctx.Err()
+	case <-ctx.Done():
+		var zero T
+		return zero, ctx.Err()
+	}
+}
+
+func New(cfg config.Config, cachePath string, stores ...*usage.Store) *Runner {
+	r := &Runner{
+		cfg: cfg, lookPath: exec.LookPath, command: cli.Command,
+		cachePath: cachePath,
+	}
+	if cfg.AdaptiveEnabled() && len(stores) > 0 {
+		r.usage = stores[0]
+	}
+	return r
 }
 
 func (r *Runner) Run(ctx context.Context, request Request) Result {
@@ -79,37 +127,81 @@ func (r *Runner) Run(ctx context.Context, request Request) Result {
 		request.Images, extraDirs, err = resolveImages(cwd, request.Images)
 	}
 
-	var path, fallback, family string
-	if err == nil && backend == "codex" {
-		var reason string
-		path, reason, err = r.codex(ctx)
-		if err == nil && reason == "" && models.IsFamily(model.Model) {
-			var slug string
-			slug, reason, err = r.resolveCodex(ctx, path, model.Model)
-			if slug != "" {
-				family, model.Model = model.Model, slug
-			}
+	var path, fallback, family, routing string
+	var claudeUsage, codexUsage usage.Snapshot
+	auto := request.Backend == "" || request.Backend == "auto"
+	if err == nil && r.usage != nil {
+		claudePath, claudeErr := r.lookPath("claude")
+		if claudeErr != nil {
+			claudePath = ""
 		}
-		if err == nil && reason != "" {
-			if request.Backend == "codex" {
-				err = errors.New(reason)
-			} else {
-				fallback = reason
+		codexPath, codexErr := r.lookPath("codex")
+		if codexErr != nil {
+			codexPath = ""
+		}
+		claudeUsage, codexUsage = r.usage.RefreshBoth(ctx, claudePath, codexPath, false)
+		if auto {
+			backend, routing = usage.Decide(claudeUsage, codexUsage, tier.Claude.Model, tier.Codex.Model, time.Now())
+			if backend == "" {
+				err = errors.New(routing)
+				backend = "none"
+			} else if backend == "claude" {
+				model = tier.Claude
+				fallback = routing
+			}
+		} else {
+			snapshot := codexUsage
+			if backend == "claude" {
+				snapshot = claudeUsage
+			}
+			if _, _, blocked := snapshot.Pressure(model.Model, time.Now()); blocked {
+				err = fmt.Errorf("%s usage exhausted", backend)
 			}
 		}
 	}
-	if err == nil && (backend == "claude" || fallback != "") {
-		backend, model = "claude", tier.Claude
-		path, err = r.lookPath("claude")
-		if err != nil {
-			err = fmt.Errorf("claude unavailable: %w", err)
-		}
-	}
-
 	var report string
 	var stderr tailBuffer
-	if err == nil {
-		report, err = r.run(ctx, backend, path, model, cwd, request, extraDirs, &stderr)
+	for retried := false; err == nil; retried = true {
+		if backend == "codex" {
+			var reason string
+			path, reason, err = r.codex(ctx)
+			if err == nil && reason == "" && models.IsFamily(model.Model) {
+				var slug string
+				slug, reason, err = r.resolveCodex(ctx, path, model.Model)
+				if slug != "" {
+					family, model.Model = model.Model, slug
+				}
+			}
+			if err == nil && reason != "" {
+				err = errors.New(reason)
+			}
+		} else {
+			path, err = r.lookPath("claude")
+			if err != nil {
+				err = fmt.Errorf("claude unavailable: %w", err)
+			}
+		}
+		var started bool
+		if err == nil {
+			report, started, err = r.run(ctx, backend, path, model, cwd, request, extraDirs, &stderr)
+		}
+		// Never retry a task once the worker process has started: it may
+		// already have made changes even if it exits with an error.
+		if err == nil || started || !auto || retried || ctx.Err() != nil {
+			break
+		}
+		other, otherModel, snapshot := "claude", tier.Claude, claudeUsage
+		if backend == "claude" {
+			other, otherModel, snapshot = "codex", tier.Codex, codexUsage
+		}
+		if _, _, blocked := snapshot.Pressure(otherModel.Model, time.Now()); blocked {
+			err = fmt.Errorf("%w; %s usage exhausted", err, other)
+			break
+		}
+		fallback = err.Error()
+		backend, model, family = other, otherModel, ""
+		stderr = tailBuffer{}
+		err = nil
 	}
 	contextErr := ctx.Err()
 	failed := err != nil || contextErr != nil
@@ -124,6 +216,16 @@ func (r *Runner) Run(ctx context.Context, request Request) Result {
 		backend, label, model.Effort, time.Since(start).Round(time.Millisecond))
 	if fallback != "" {
 		header += "fallback: " + fallback + "\n"
+	}
+	if routing != "" {
+		header += "routing: " + routing + "\n"
+	}
+	if r.usage != nil {
+		reason := routing
+		if fallback != "" {
+			reason = fallback
+		}
+		r.usage.Record(usage.Event{At: start, Backend: backend, Tier: request.Tier, Model: model.Model, ElapsedMS: time.Since(start).Milliseconds(), Failed: failed, Fallback: fallback != "", Reason: reason})
 	}
 	return Result{Text: header + report, IsError: failed}
 }
@@ -157,51 +259,34 @@ func resolveImages(cwd string, paths []string) (images, extraDirs []string, err 
 }
 
 func (r *Runner) resolveCodex(ctx context.Context, codexPath, family string) (slug, reason string, err error) {
-	r.catalogOnce.Do(func() {
-		// A delegate can stop waiting without cancelling the shared refresh.
-		go func() {
-			defer close(r.catalogReady)
-			r.catalog, _ = models.ReadCache(r.cachePath)
-			if !r.catalog.Fresh() {
-				r.catalog, r.catalogErr = models.Refresh(r.cachePath, r.catalog, func() (models.Catalog, error) {
-					return models.Fetch(codexPath, r.command)
-				})
-			}
-		}()
+	probe, err := r.catalogCache.get(ctx, func() (catalogProbe, time.Duration) {
+		catalog, _ := models.ReadCache(r.cachePath)
+		var err error
+		if !catalog.Fresh() {
+			catalog, err = models.Refresh(r.cachePath, catalog, func() (models.Catalog, error) { return models.Fetch(codexPath, r.command) })
+		}
+		// A short process-local cache also allows a failed fetch to recover.
+		return catalogProbe{catalog, err}, usage.RefreshInterval
 	})
-	select {
-	case <-r.catalogReady:
-		if err := ctx.Err(); err != nil {
-			return "", "", err
-		}
-		if entry, ok := r.catalog.Resolve(family); ok {
-			return entry.Slug, "", nil
-		}
-		reason := fmt.Sprintf("codex model family %q could not be resolved", family)
-		if r.catalogErr != nil {
-			reason += ": " + r.catalogErr.Error()
-		}
-		return "", reason, nil
-	case <-ctx.Done():
-		return "", "", ctx.Err()
+	if err != nil {
+		return "", "", err
 	}
+	if entry, ok := probe.catalog.Resolve(family); ok {
+		return entry.Slug, "", nil
+	}
+	reason = fmt.Sprintf("codex model family %q could not be resolved", family)
+	if probe.err != nil {
+		reason += ": " + probe.err.Error()
+	}
+	return "", reason, nil
 }
 
 func (r *Runner) codex(ctx context.Context) (path, reason string, err error) {
-	r.codexOnce.Do(func() {
-		// A cancelled delegate must not cache a failed login probe for
-		// every subsequent delegate. Give the shared probe its own deadline.
-		go func() {
-			defer close(r.codexReady)
-			r.codexPath, r.codexReason = r.probeCodex()
-		}()
+	probe, err := r.codexCache.get(ctx, func() (loginProbe, time.Duration) {
+		p, reason := r.probeCodex()
+		return loginProbe{p, reason}, usage.RefreshInterval
 	})
-	select {
-	case <-r.codexReady:
-		return r.codexPath, r.codexReason, ctx.Err()
-	case <-ctx.Done():
-		return "", "", ctx.Err()
-	}
+	return probe.path, probe.reason, err
 }
 
 func (r *Runner) probeCodex() (path, reason string) {
@@ -222,19 +307,19 @@ func (r *Runner) probeCodex() (path, reason string) {
 	return path, ""
 }
 
-func (r *Runner) run(ctx context.Context, backend, path string, model config.Model, cwd string, request Request, extraDirs []string, stderr *tailBuffer) (string, error) {
+func (r *Runner) run(ctx context.Context, backend, path string, model config.Model, cwd string, request Request, extraDirs []string, stderr *tailBuffer) (string, bool, error) {
 	var args []string
 	var stdout bytes.Buffer
 	var outputPath string
 	if backend == "codex" {
 		file, err := os.CreateTemp("", "furu-codex-*.txt")
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		outputPath = file.Name()
 		defer os.Remove(outputPath)
 		if err := file.Close(); err != nil {
-			return "", err
+			return "", false, err
 		}
 		args = codexArgs(model, request.Write, cwd, outputPath, request.Images, extraDirs)
 	} else {
@@ -249,7 +334,7 @@ func (r *Runner) run(ctx context.Context, backend, path string, model config.Mod
 	}
 	cmd, err := r.command(ctx, path, args...)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	cmd.Dir = cwd
 	cmd.Stdin = strings.NewReader(task)
@@ -257,17 +342,20 @@ func (r *Runner) run(ctx context.Context, backend, path string, model config.Mod
 	if backend == "claude" {
 		cmd.Stdout = &stdout
 	}
-	if err := cmd.Run(); err != nil {
-		return "", err
+	if err := cmd.Start(); err != nil {
+		return "", false, err
+	}
+	if err := cmd.Wait(); err != nil {
+		return "", true, err
 	}
 	if backend == "claude" {
-		return stdout.String(), nil
+		return stdout.String(), true, nil
 	}
 	report, err := os.ReadFile(outputPath)
 	if err != nil {
-		return "", fmt.Errorf("read codex final message: %w", err)
+		return "", true, fmt.Errorf("read codex final message: %w", err)
 	}
-	return string(report), nil
+	return string(report), true, nil
 }
 
 func codexArgs(model config.Model, write bool, cwd, output string, images, extraDirs []string) []string {

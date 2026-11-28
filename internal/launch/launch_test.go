@@ -30,9 +30,12 @@ func TestArgs(t *testing.T) {
 		!strings.Contains(args[5], "git commit / git push を直接使わない。") || strings.Contains(args[5], guruPromptHint) {
 		t.Errorf("missing orchestrator prompt: %v", args[4:6])
 	}
-	const wantSettings = `{"attribution":{"commit":"","pr":""},"env":{"MCP_TOOL_TIMEOUT":"780000"},"permissions":{"allow":["mcp__furu__delegate"],"deny":["Bash(git commit:*)","Bash(git push:*)"]}}`
-	if args[6] != "--settings" || args[7] != wantSettings {
-		t.Errorf("settings = %v, want %s", args[6:8], wantSettings)
+	var gotSettings settings
+	if args[6] != "--settings" || json.Unmarshal([]byte(args[7]), &gotSettings) != nil || gotSettings.Env["MCP_TOOL_TIMEOUT"] != "780000" || !slices.Equal(gotSettings.Permissions.Deny, []string{"Bash(git commit:*)", "Bash(git push:*)"}) || !slices.Equal(gotSettings.Permissions.Allow, []string{"mcp__furu__delegate"}) {
+		t.Fatalf("settings = %v", args[6:8])
+	}
+	if len(gotSettings.Hooks["UserPromptSubmit"]) != 1 || !slices.Equal(gotSettings.Hooks["UserPromptSubmit"][0].Hooks[0].Args, []string{"usage-hook"}) || gotSettings.StatusLine == nil || !strings.Contains(gotSettings.StatusLine.Command, "usage-statusline") {
+		t.Errorf("missing usage integration: %s", args[7])
 	}
 	var mcpConfig struct {
 		MCPServers map[string]mcpServer `json:"mcpServers"`
@@ -40,12 +43,47 @@ func TestArgs(t *testing.T) {
 	if err := json.Unmarshal([]byte(args[9]), &mcpConfig); err != nil {
 		t.Fatal(err)
 	}
-	wantServer := mcpServer{Type: "stdio", Command: executable, Args: []string{"mcp"}}
+	wantServer := mcpServer{Type: "stdio", Command: executable, Args: []string{"mcp"}, AlwaysLoad: true}
 	if args[8] != "--mcp-config" || len(mcpConfig.MCPServers) != 1 || !reflect.DeepEqual(mcpConfig.MCPServers["furu"], wantServer) {
 		t.Errorf("MCP config = %v", args[8:10])
 	}
 	if !slices.Equal(args[10:], user) {
 		t.Errorf("pass-through = %q, want %q", args[10:], user)
+	}
+}
+
+func TestAdaptiveDisabled(t *testing.T) {
+	cfg := config.Defaults()
+	off := false
+	cfg.AdaptiveDelegation = &off
+	args := Args(cfg, commitcmd.Result{}, "/tools/furu", nil)
+	var s settings
+	if err := json.Unmarshal([]byte(args[slices.Index(args, "--settings")+1]), &s); err != nil {
+		t.Fatal(err)
+	}
+	if s.StatusLine != nil || s.Hooks != nil {
+		t.Fatal("adaptive integration should be disabled")
+	}
+}
+
+func TestHandoffHooks(t *testing.T) {
+	marker := `C:\User Data\furu\handoff.json`
+	args := Args(config.Defaults(), commitcmd.Result{}, "/tools/furu", nil, marker)
+	var s settings
+	if err := json.Unmarshal([]byte(args[slices.Index(args, "--settings")+1]), &s); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []string{"StopFailure", "Stop", "SessionStart"} {
+		hooks := s.Hooks[event]
+		if len(hooks) != 1 || len(hooks[0].Hooks) != 1 || !slices.Equal(hooks[0].Hooks[0].Args, []string{"handoff-hook", marker}) {
+			t.Fatalf("missing handoff hook %s: %+v", event, hooks)
+		}
+	}
+	if s.Hooks["StopFailure"][0].Matcher != "rate_limit" {
+		t.Fatal("StopFailure does not filter rate limits")
+	}
+	if hooks := s.Hooks["UserPromptSubmit"][0].Hooks; len(hooks) != 2 || !slices.Equal(hooks[1].Args, []string{"handoff-hook", marker}) {
+		t.Fatalf("missing pending prompt capture: %+v", hooks)
 	}
 }
 
@@ -89,5 +127,42 @@ func TestPromptWithAutoDetectedGuru(t *testing.T) {
 	prompt := args[slices.Index(args, "--append-system-prompt")+1]
 	if !strings.Contains(prompt, "`guru s -y \"<message>\"`") || !strings.Contains(prompt, guruPromptHint) {
 		t.Errorf("missing auto-detected guru instructions:\n%s", prompt)
+	}
+}
+
+func TestCodexOrchestratorArgs(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.WorkerTimeoutMinutes = 12
+	commit := commitcmd.Result{Command: `my & wrapper -y`, Source: commitcmd.SourceConfig}
+	executable := `C:\Program Files\日本語\furu.exe`
+	user := []string{"resume", "session-id", "日本語の依頼"}
+	args := CodexArgs(cfg, commit, executable, user)
+	if !slices.Equal(args[len(args)-len(user):], user) {
+		t.Fatalf("pass-through = %v", args)
+	}
+	values := make(map[string]string)
+	for i := 0; i < len(args)-len(user); i += 2 {
+		key, value, found := strings.Cut(args[i+1], "=")
+		if args[i] != "-c" || !found {
+			t.Fatalf("bad config override: %v", args[i:i+2])
+		}
+		values[key] = value
+	}
+	var prompt, path string
+	if err := json.Unmarshal([]byte(values["developer_instructions"]), &prompt); err != nil || prompt != codexOrchestratorPrompt(commit) ||
+		!strings.Contains(prompt, "Codex の司令塔") || !strings.Contains(prompt, "mcp__furu__delegate") || !strings.Contains(prompt, commit.Command) ||
+		strings.Contains(prompt, "Claude の利用枠は計画・統合・最終判断のため温存する。") {
+		t.Fatalf("orchestration prompt = %q, error = %v", prompt, err)
+	}
+	if err := json.Unmarshal([]byte(values["mcp_servers.furu.command"]), &path); err != nil || path != executable {
+		t.Fatalf("MCP executable = %q, error = %v", path, err)
+	}
+	if values["mcp_servers.furu.args"] != `["mcp"]` || values["mcp_servers.furu.tool_timeout_sec"] != "780" ||
+		values["mcp_servers.furu.enabled"] != "true" || values["mcp_servers.furu.supports_parallel_tool_calls"] != "true" {
+		t.Fatalf("MCP overrides = %v", values)
+	}
+	var env []string
+	if err := json.Unmarshal([]byte(values["mcp_servers.furu.env_vars"]), &env); err != nil || !slices.Contains(env, "APPDATA") || !slices.Contains(env, "PATH") {
+		t.Fatalf("MCP environment = %v, error = %v", env, err)
 	}
 }

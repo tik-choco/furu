@@ -104,6 +104,7 @@ func TestPreflightUpdatesAndChecksAuth(t *testing.T) {
 				codexUpdated.Store(true)
 			case "claude auth status":
 				fmt.Fprint(stdout, `{"loggedIn":false}`)
+				return errors.New("exit status 1")
 			case "codex login status":
 				fmt.Fprint(stdout, "Not LOGGED in")
 			default:
@@ -116,13 +117,40 @@ func TestPreflightUpdatesAndChecksAuth(t *testing.T) {
 		stderr: &logs,
 	}
 	result := c.check(Options{Versions: true, Update: true, Login: true})
-	if result.ClaudePath != "claude" || !result.ClaudeAuthFailed || !codexUpdated.Load() {
+	if result.ClaudePath != "claude" || !result.ClaudeAuthFailed || result.CodexPath != "codex" || !result.CodexAuthFailed || !codexUpdated.Load() {
 		t.Fatalf("preflight result = %+v, updated = %v", result, codexUpdated.Load())
 	}
 	for _, want := range []string{"claude 2.1.330", "codex 0.170.0 → 0.171.0", "codex 0.171.0 に更新しました", "claude auth login", "codex login"} {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("logs missing %q: %s", want, logs.String())
 		}
+	}
+}
+
+func TestClaudeAuthCommandFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name, output string
+		failed       bool
+	}{
+		{"unknown", "unexpected output", false},
+		{"expired", `{"loggedIn":true,"loginExpiresAt":"2000-01-01T00:00:00Z"}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			c := checker{
+				run: func(_ context.Context, _ string, _ []string, stdout, _ io.Writer) error {
+					fmt.Fprint(stdout, tc.output)
+					return errors.New("exit status 1")
+				},
+				stderr: &logs,
+			}
+			if got := c.checkClaudeAuth("claude"); got != tc.failed {
+				t.Fatalf("authFailed = %v, logs = %s", got, &logs)
+			}
+			if !tc.failed && !strings.Contains(logs.String(), "ログイン状態を確認できません") {
+				t.Fatal(&logs)
+			}
+		})
 	}
 }
 
@@ -149,7 +177,7 @@ func TestLoginOnlyDoesNotCheckVersions(t *testing.T) {
 		stderr: &logs,
 	}
 	result := c.check(Options{Login: true})
-	if !result.ClaudeAuthFailed || !strings.Contains(logs.String(), "codex login") {
+	if !result.ClaudeAuthFailed || !result.CodexAuthFailed || !strings.Contains(logs.String(), "codex login") {
 		t.Fatalf("result = %+v, logs = %s", result, &logs)
 	}
 }

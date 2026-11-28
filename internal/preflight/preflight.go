@@ -30,6 +30,7 @@ type Result struct {
 	ClaudePath       string
 	ClaudeAuthFailed bool
 	CodexPath        string
+	CodexAuthFailed  bool
 }
 
 type checker struct {
@@ -53,7 +54,7 @@ func (c *checker) check(options Options) Result {
 		defer wg.Done()
 		result.ClaudePath, result.ClaudeAuthFailed = c.checkCLI("claude", "@anthropic-ai/claude-code", options)
 	}()
-	result.CodexPath, _ = c.checkCLI("codex", "@openai/codex", options)
+	result.CodexPath, result.CodexAuthFailed = c.checkCLI("codex", "@openai/codex", options)
 	wg.Wait()
 	return result
 }
@@ -75,7 +76,7 @@ func (c *checker) checkCLI(name, npmPackage string, options Options) (path strin
 		if name == "claude" {
 			return path, c.checkClaudeAuth(path)
 		}
-		c.checkCodexAuth(path)
+		return path, c.checkCodexAuth(path)
 	}
 	return path, false
 }
@@ -121,19 +122,26 @@ func (c *checker) checkVersion(name, path, npmPackage string, update bool) {
 
 func (c *checker) checkClaudeAuth(path string) bool {
 	var out bytes.Buffer
-	if err := c.execute(probeTimeout, path, []string{"auth", "status"}, &out, nil); err != nil {
-		c.log("claude: ログイン状態を確認できません: %v", err)
-		return false
-	}
+	// auth status returns a non-zero exit code when logged out, but still
+	// writes the login status to stdout.
+	runErr := c.execute(probeTimeout, path, []string{"auth", "status"}, &out, nil)
 	auth, err := parseClaudeAuth(out.Bytes())
 	if err != nil {
-		c.log("claude: ログイン状態を読み取れません: %v", err)
+		if runErr != nil {
+			c.log("claude: ログイン状態を確認できません: %v", runErr)
+		} else {
+			c.log("claude: ログイン状態を読み取れません: %v", err)
+		}
 		return false
 	}
 	now := time.Now()
 	if !auth.loggedIn || (auth.expiresAt != nil && !auth.expiresAt.After(now)) {
 		c.log("claude: ログインが切れています。`claude auth login` を実行してください")
 		return true
+	}
+	if runErr != nil {
+		c.log("claude: ログイン状態を確認できません: %v", runErr)
+		return false
 	}
 	if auth.expiresAt != nil && auth.expiresAt.Sub(now) <= 72*time.Hour {
 		c.log("claude: ログインの有効期限が近づいています (%s)", auth.expiresAt.Local().Format("2006-01-02 15:04:05 MST"))
@@ -143,14 +151,15 @@ func (c *checker) checkClaudeAuth(path string) bool {
 	return false
 }
 
-func (c *checker) checkCodexAuth(path string) {
+func (c *checker) checkCodexAuth(path string) bool {
 	var out bytes.Buffer
 	err := c.execute(probeTimeout, path, []string{"login", "status"}, &out, &out)
 	if !CodexLoggedIn(out.String(), err) {
 		c.log("codex: ログインしていません。`codex login` を実行してください（GPT worker は Claude にフォールバックします）")
-		return
+		return true
 	}
 	c.log("codex: ログイン済み")
+	return false
 }
 
 func CodexLoggedIn(output string, err error) bool {

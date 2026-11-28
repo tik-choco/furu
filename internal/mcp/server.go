@@ -118,6 +118,7 @@ func (s *server) handle(line []byte) {
 			"protocolVersion": params.ProtocolVersion,
 			"capabilities":    map[string]any{"tools": struct{}{}},
 			"serverInfo":      map[string]string{"name": "furu", "version": "0.1.0"},
+			"instructions":    "Delegate substantive implementation, repository investigation and testing to furu workers. Use backend=auto to select an available worker according to usage limits. Keep orchestration, integration and review in the parent session.",
 		}})
 	case "ping", "tools/list":
 		if len(req.Params) > 0 && req.Params[0] != '{' {
@@ -271,7 +272,8 @@ func parseCall(raw json.RawMessage) (worker.Request, error) {
 func delegateTool() map[string]any {
 	return map[string]any{
 		"name":        "delegate",
-		"description": "Runs a self-contained sub-task on a worker agent (GPT via Codex preferred, Claude fallback) and returns its final report.",
+		"description": "Delegate a self-contained implementation, investigation, or testing task to a worker before doing it yourself. Auto selects the backend using available usage information, with Codex as the default. Returns a final report.",
+		"_meta":       map[string]any{"anthropic/alwaysLoad": true},
 		"inputSchema": map[string]any{
 			"type":     "object",
 			"required": []string{"task", "tier"},

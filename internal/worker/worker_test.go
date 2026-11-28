@@ -17,6 +17,7 @@ import (
 
 	"github.com/tik-choco/furu/internal/config"
 	"github.com/tik-choco/furu/internal/models"
+	"github.com/tik-choco/furu/internal/usage"
 )
 
 func TestCodexArgs(t *testing.T) {
@@ -292,6 +293,102 @@ func TestCodexFailureDoesNotFallBack(t *testing.T) {
 	}
 }
 
+func TestAdaptiveRouting(t *testing.T) {
+	for _, tc := range []struct {
+		claude, codex float64
+		backend       string
+		want          string
+		failed        bool
+	}{{20, 95, "auto", "claude", false}, {80, 95, "auto", "codex", false}, {100, 100, "auto", "none", true}, {20, 95, "codex", "codex", false}, {100, 20, "claude", "claude", true}} {
+		t.Run(fmt.Sprintf("%g-%g-%s", tc.claude, tc.codex, tc.backend), func(t *testing.T) {
+			r := testRunner(t, "success")
+			r.usage = usage.New(filepath.Join(t.TempDir(), "config.json"))
+			now := time.Now()
+			for backend, percent := range map[string]float64{"claude": tc.claude, "codex": tc.codex} {
+				if err := r.usage.Save(backend, usage.Snapshot{ObservedAt: now, Windows: []usage.Window{{Name: "5h", Used: percent, ResetsAt: now.Add(time.Hour)}}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result := r.Run(context.Background(), Request{Task: "test", Tier: "normal", Backend: tc.backend})
+			if result.IsError != tc.failed || !strings.HasPrefix(result.Text, "[furu] backend="+tc.want+" ") {
+				t.Fatal(result)
+			}
+		})
+	}
+}
+
+func TestAdaptiveRoutingUnavailableBackend(t *testing.T) {
+	for _, tc := range []struct {
+		name, backend, unavailable, phase, want string
+		codexPercent                            float64
+		failed                                  bool
+	}{
+		{"Claude missing", "auto", "claude", "lookup", "codex", 95, false},
+		{"Codex missing", "auto", "codex", "lookup", "claude", 20, false},
+		{"Claude cannot start", "auto", "claude", "start", "codex", 95, false},
+		{"Codex cannot start", "auto", "codex", "start", "claude", 20, false},
+		{"Claude command rejected", "auto", "claude", "command", "codex", 95, false},
+		{"no spare capacity", "auto", "claude", "lookup", "claude", 100, true},
+		{"explicit Claude", "claude", "claude", "lookup", "claude", 95, true},
+		{"Claude already started", "auto", "claude", "exit", "claude", 95, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mode := "success"
+			if tc.phase == "exit" {
+				mode = "claude-worker-failure"
+			}
+			r := testRunner(t, mode)
+			r.usage = usage.New(filepath.Join(t.TempDir(), "config.json"))
+			now := time.Now()
+			for backend, percent := range map[string]float64{"claude": 20, "codex": tc.codexPercent} {
+				if err := r.usage.Save(backend, usage.Snapshot{ObservedAt: now, Windows: []usage.Window{{Used: percent}}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r.lookPath = func(name string) (string, error) {
+				if name == tc.unavailable && tc.phase == "lookup" {
+					return "", exec.ErrNotFound
+				}
+				return name, nil
+			}
+			command := r.command
+			missing := filepath.Join(t.TempDir(), "missing-executable")
+			r.command = func(ctx context.Context, path string, args ...string) (*exec.Cmd, error) {
+				if path == tc.unavailable && (args[0] == "exec" || args[0] == "-p") {
+					switch tc.phase {
+					case "start":
+						return exec.CommandContext(ctx, missing), nil
+					case "command":
+						return nil, os.ErrPermission
+					}
+				}
+				return command(ctx, path, args...)
+			}
+			result := r.Run(context.Background(), Request{Task: "test", Tier: "normal", Backend: tc.backend})
+			if result.IsError != tc.failed || !strings.HasPrefix(result.Text, "[furu] backend="+tc.want+" ") {
+				t.Fatal(result)
+			}
+			if !tc.failed && !strings.Contains(result.Text, "fallback:") {
+				t.Fatal(result)
+			}
+		})
+	}
+}
+
+func TestFailedLoginProbeExpires(t *testing.T) {
+	r := testRunner(t, "logged-out")
+	_, reason, err := r.codex(context.Background())
+	if err != nil || reason == "" {
+		t.Fatal(reason, err)
+	}
+	r.codexCache.current.expires = time.Now().Add(-time.Second)
+	r.command = testRunner(t, "success").command
+	_, reason, err = r.codex(context.Background())
+	if err != nil || reason != "" {
+		t.Fatal(reason, err)
+	}
+}
+
 func TestWorkerTimeout(t *testing.T) {
 	r := testRunner(t, "worker-wait")
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -364,6 +461,9 @@ func TestWorkerProcess(t *testing.T) {
 		}
 		fmt.Fprint(os.Stdout, "discard this")
 	} else {
+		if mode == "claude-worker-failure" {
+			os.Exit(23)
+		}
 		fmt.Fprint(os.Stdout, string(input))
 	}
 	os.Exit(0)

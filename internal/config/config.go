@@ -27,8 +27,10 @@ type Config struct {
 	Tiers                map[string]Tier `json:"tiers"`
 	// CommitCommand selects auto-detection (empty or "auto"), plain "git",
 	// or an explicit commit wrapper.
-	CommitCommand string `json:"commit_command,omitempty"`
-	GitSync       *bool  `json:"git_sync,omitempty"`
+	CommitCommand      string `json:"commit_command,omitempty"`
+	GitSync            *bool  `json:"git_sync,omitempty"`
+	AdaptiveDelegation *bool  `json:"adaptive_delegation,omitempty"`
+	UsageStatusLine    *bool  `json:"usage_statusline,omitempty"`
 }
 
 func TierNames() []string {
@@ -68,6 +70,9 @@ func (c Config) WorkerTimeout() time.Duration {
 func (c Config) GitSyncEnabled() bool {
 	return c.GitSync == nil || *c.GitSync
 }
+
+func (c Config) AdaptiveEnabled() bool   { return c.AdaptiveDelegation == nil || *c.AdaptiveDelegation }
+func (c Config) StatusLineEnabled() bool { return c.UsageStatusLine == nil || *c.UsageStatusLine }
 
 func Load() (Config, string, error) {
 	dir, err := os.UserConfigDir()
@@ -109,6 +114,8 @@ func decode(path string, data []byte) (Config, error) {
 		Tiers                map[string]Tier `json:"tiers"`
 		CommitCommand        string          `json:"commit_command"`
 		GitSync              *bool           `json:"git_sync"`
+		AdaptiveDelegation   *bool           `json:"adaptive_delegation"`
+		UsageStatusLine      *bool           `json:"usage_statusline"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -135,6 +142,8 @@ func decode(path string, data []byte) (Config, error) {
 	cfg.Orchestrator.merge(overrides.Orchestrator)
 	cfg.CommitCommand = overrides.CommitCommand
 	cfg.GitSync = overrides.GitSync
+	cfg.AdaptiveDelegation = overrides.AdaptiveDelegation
+	cfg.UsageStatusLine = overrides.UsageStatusLine
 	for name, override := range overrides.Tiers {
 		tier := cfg.Tiers[name]
 		tier.Codex.merge(override.Codex)
